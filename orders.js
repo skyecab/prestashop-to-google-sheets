@@ -1,8 +1,12 @@
 function actualizarOrdenes() {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(5000)) { Logger.log('Saltando: hay otra ejecución.'); return; }
+  if (!lock.tryLock(10000)) { Logger.log('Saltando: hay otra ejecución.'); return; }
   try {
-    syncOrdenes_({ soloNuevas: true });
+    const added = Number(syncOrdenes_()) || 0;
+    safeNotify_(`Órdenes: sincronización completa. Nuevas: ${added}.`);
+  } catch (e) {
+    safeNotify_('Error en actualizarOrdenes: ' + e);
+    throw e;
   } finally {
     lock.releaseLock();
   }
@@ -18,6 +22,7 @@ function actualizarOrdenes() {
 */
 
 function syncOrdenes_(opciones) {
+  // 0) Normaliza opciones y usa un solo objeto "opts" en todo el flujo
   const hoja = 'Órdenes';
   const sheet = ensureSheet_(hoja);
   const pageSize = CONFIG.PAGE_SIZE || 100;
@@ -32,7 +37,7 @@ function syncOrdenes_(opciones) {
 
   // 2) Último ID (para solo nuevas)
   let lastId = 0;
-  if (opciones.soloNuevas) {
+  if (opts.soloNuevas) {
     const idColIndex = headers.indexOf('id') + 1;
     if (sheet.getLastRow() > 1 && idColIndex > 0) {
       const ids = sheet.getRange(2, idColIndex, sheet.getLastRow() - 1, 1).getValues()
@@ -43,10 +48,10 @@ function syncOrdenes_(opciones) {
 
   // 3) Límite por días (opcional)
   let fechaLimite = null;
-  if (opciones.diasAtras) {
+  if (opts.diasAtras) {
     const hoy = new Date();
     fechaLimite = new Date(hoy.getTime());
-    fechaLimite.setDate(hoy.getDate() - opciones.diasAtras);
+    fechaLimite.setDate(hoy.getDate() - opts.diasAtras);
   }
 
   // 4) Descarga incremental (ordenado por id_DESC)
@@ -66,10 +71,10 @@ function syncOrdenes_(opciones) {
 
     for (const o of orders) {
       const oid = Number(o.id);
-      if (opciones.soloNuevas && oid <= lastId) { stop = true; break; }
+      if (opts.soloNuevas && oid <= lastId) { stop = true; break; }
       if (fechaLimite) {
-        const fechaOrden = new Date(o.date_add);
-        if (fechaOrden < fechaLimite) { stop = true; break; }
+        const f = (typeof _parseDateSafe_ === 'function') ? _parseDateSafe_(o.date_add) : new Date(o.date_add);
+        if (f && f < fechaLimite) { stop = true; break; }
       }
 
       // 4.1) Construir fila con headers actuales
@@ -81,7 +86,8 @@ function syncOrdenes_(opciones) {
 
       // 4.2) Traducción de estado
       const idxEstadoNom = headers.indexOf('estado_nombre');
-      const estadoTrad = ORDER_STATES[o.current_state] || (o.current_state !== undefined ? `Estado ${o.current_state}` : '');
+      const cs = (o.current_state != null) ? Number(o.current_state) : null;
+      const estadoTrad = (cs != null) ? (ORDER_STATES[cs] || `Estado ${o.current_state}`) : '';
       if (idxEstadoNom >= 0) row[idxEstadoNom] = estadoTrad;
 
       rowsToPrepend.push(row);
@@ -99,34 +105,36 @@ function syncOrdenes_(opciones) {
   }
 
   // 6) REFRESH masivo de 'estado_nombre' para TODAS las filas
-  if (sheet.getLastRow() > 1) {
+  if (typeof refreshEstadoNombre_ === 'function') {
+    refreshEstadoNombre_(sheet, headers);
+  } else {
+    // Fallback
     const idxEstado   = headers.indexOf('current_state');
     const idxEstadoNm = headers.indexOf('estado_nombre');
     const nRows = sheet.getLastRow() - 1;
 
-    if (idxEstado !== -1 && idxEstadoNm !== -1) {
+    if (idxEstado !== -1 && idxEstadoNm !== -1 && nRows > 0) {
       const estados = sheet.getRange(2, idxEstado + 1, nRows, 1).getValues().flat();
       const traducidos = estados.map(v => {
         const k = Number(v);
         return ORDER_STATES[k] || (v !== '' ? `Estado ${v}` : '');
       });
-      // escribe solo la columna estado_nombre
+      // Escribe solo la columna estado_nombre
       sheet.getRange(2, idxEstadoNm + 1, nRows, 1)
         .setValues(traducidos.map(x => [x]));
     }
   }
 
-  // 6) Refresh masivo de 'estado_nombre' para TODAS las filas (asegura consistencia)
-  refreshEstadoNombre_(sheet, headers);
-
   // 7) Enriquecimiento de WEIGHT desde /order_carriers
   // 7.1) Backfill para nuevas órdenes
-  const filledNew = fillWeightForIds_(sheet, headers, newOrderIds);
+  const filledNew = (typeof fillWeightForIds_ === 'function')
+    ? fillWeightForIds_(sheet, headers, newOrderIds) : 0;
 
   // 7.2) Backfill adicional (opcional) para filas existentes con weight vacío (hasta límite)
   let filledExisting = 0;
   if (opts.backfillWeightLimit && opts.backfillWeightLimit > 0) {
-  filledExisting = backfillMissingWeights_(sheet, headers, opts.backfillWeightLimit);
+    filledExisting = (typeof backfillMissingWeights_ === 'function')
+    ? backfillMissingWeights_(sheet, headers, opts.backfillWeightLimit) : 0;
   }
 
   // 8) Enriquecer Clientes/Direcciones solo si hubo nuevas
@@ -137,10 +145,13 @@ function syncOrdenes_(opciones) {
 
   // 9) Notificación final
   const msg = [];
-  if (rowsToPrepend.length) msg.push(`Órdenes nuevas: ${rowsToPrepend.length}`);
+  msg.push(`Órdenes nuevas: ${rowsToPrepend.length}`);  // Siempre muestra el número, aunque sea 0
   msg.push('Estado actualizado');
   if (filledNew) msg.push(`Peso nuevas: ${filledNew}`);
   if (filledExisting) msg.push(`Peso backfill: ${filledExisting}`);
+  if (msg.length) safeNotify_(msg.join(' · '));
+
+  return rowsToPrepend.length;
 }
 
 
@@ -148,16 +159,20 @@ function syncOrdenes_(opciones) {
 function ensureExtraColumns_(sheet, headers, extraCols) {
   const current = headers.slice();
   let changed = false;
+
   extraCols.forEach(col => {
     if (!current.includes(col)) {
-      const last = sheet.getLastColumn();
+      const last = Math.max(1, sheet.getLastColumn());
       sheet.insertColumnAfter(last);
       sheet.getRange(1, last + 1).setValue(col);
       current.push(col);
       changed = true;
     }
   });
-  return changed ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0] : current;
+
+  return changed 
+    ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0] 
+    : current;
 }
 
 /** Refresca la columna estado_nombre para todas las filas de la hoja */
@@ -166,11 +181,15 @@ function refreshEstadoNombre_(sheet, headers) {
   const idxEstado = headers.indexOf('current_state');
   const idxEstadoNm = headers.indexOf('estado_nombre');
   const nRows = sheet.getLastRow() - 1;
-  if (idxEstado === -1 || idxEstadoNm === -1) return;
+  if (idxEstado === -1 || idxEstadoNm === -1 || nRows <= 0) return;
+
   const estados = sheet.getRange(2, idxEstado + 1, nRows, 1).getValues().flat();
+
   const traducidos = estados.map(v => {
     const k = Number(v);
-    return ORDER_STATES[k] || (v !== '' ? `Estado ${v}` : '');
+    return (isFinite(k) && k in ORDER_STATES)
+      ? ORDER_STATES[k]
+      : (v !== '' ? `Estado ${v}` : '');
   });
   sheet.getRange(2, idxEstadoNm + 1, nRows, 1).setValues(traducidos.map(x => [x]));
 }
@@ -179,31 +198,47 @@ function refreshEstadoNombre_(sheet, headers) {
 /** Rellena weight para un conjunto de orderIds usando /order_carriers; retorna cuántas filas fueron actualizadas */
 function fillWeightForIds_(sheet, headers, orderIds) {
   if (!orderIds || !orderIds.length) return 0;
+
   const idxId = headers.indexOf('id');
   const idxW = headers.indexOf('weight');
   if (idxId === -1 || idxW === -1) return 0;
 
-  // Mapa desde la API
-  const weightMap = buildWeightMapByOrderIds_(Array.from(new Set(orderIds)));
-  if (!weightMap || Object.keys(weightMap).length === 0) return 0;
+  // Evita duplicados y membership
+  const targetSet = new Set(orderIds.map(String));
 
+  // Mapa desde la API
+  const weightMap = buildWeightMapByOrderIds_(Array.from(targetSet));
+  if (!weightMap || Object.keys(weightMap).length === 0) return 0;
 
   // Recorremos todas las filas y actualizamos solo ids coincidentes
   const nRows = sheet.getLastRow() - 1;
   if (nRows <= 0) return 0;
+
   const idVals = sheet.getRange(2, idxId + 1, nRows, 1).getValues().flat().map(String);
   const wVals = sheet.getRange(2, idxW + 1, nRows, 1).getValues().flat();
 
   let updates = 0;
   const out = wVals.slice();
+
   for (let i = 0; i < nRows; i++) {
     const oid = idVals[i];
-    if (orderIds.indexOf(oid) !== -1) {
-      const w = weightMap[oid];
-      if (w != null && w !== '' && out[i] !== w) { out[i] = w; updates++; }
+    if (!targetSet.has(oid)) continue;
+    const incoming = weightMap[oid];
+
+    if (incoming != null && incoming !== '') {
+      const chosen = (typeof chooseNumeric_ === 'function')
+        ? chooseNumeric_(out[i], incoming)
+        : incoming;
+      if (String(chosen) != String(out[i])){
+        out[i] = chosen; 
+        updates++;
+      }
     }
   }
-  if (updates > 0) sheet.getRange(2, idxW + 1, nRows, 1).setValues(out.map(v => [v]));
+
+  if (updates > 0) {
+    sheet.getRange(2, idxW + 1, nRows, 1).setValues(out.map(v => [v]));
+  }
   return updates;
 }
 
@@ -211,17 +246,26 @@ function fillWeightForIds_(sheet, headers, orderIds) {
 /** Busca filas con weight vacío y hace backfill hasta un límite; retorna cuántas filas actualizó */
 function backfillMissingWeights_(sheet, headers, limit) {
   if (sheet.getLastRow() <= 1) return 0;
+
   const idxId = headers.indexOf('id');
   const idxW = headers.indexOf('weight');
   if (idxId === -1 || idxW === -1) return 0;
+
   const nRows = sheet.getLastRow() - 1;
+  if (nRows <= 0) return 0;
+
   const idVals = sheet.getRange(2, idxId + 1, nRows, 1).getValues().flat().map(String);
   const wVals = sheet.getRange(2, idxW + 1, nRows, 1).getValues().flat();
 
+  const cap = Number(limit) > 0 ? Number(limit) : 0;
+
+  // Recolecta IDs con weight vacío hasta 'limit'
   const missingIds = [];
   for (let i = 0; i < nRows; i++) {
-    if ((wVals[i] == null || wVals[i] === '') && idVals[i]) missingIds.push(idVals[i]);
-    if (missingIds.length >= limit) break;
+    if ((wVals[i] == null || wVals[i] === '') && idVals[i]) {
+      missingIds.push(idVals[i]);
+      if (cap && missingIds.length >= cap) break;
+    }
   }
   if (!missingIds.length) return 0;
 
@@ -230,20 +274,33 @@ function backfillMissingWeights_(sheet, headers, limit) {
 
   let updates = 0;
   const out = wVals.slice();
+
   for (let i = 0; i < nRows; i++) {
+    if (out[i] != null && out[i] !== '') continue; // No tocar valores ya existentes
     const oid = idVals[i];
-    if ((out[i] == null || out[i] === '') && map[oid] != null && map[oid] !== '') {
-    out[i] = map[oid];
-    updates++;
+    const incoming = map[oid];
+
+    if (incoming != null && incoming !== '') {
+      const chosen = (typeof chooseNumeric_ === 'function')
+        ? chooseNumeric_(out[i], incoming)
+        : incoming;
+      if (String(chosen) !== String(out[i])){
+        out[i] = chosen;
+        updates++;
+      }
     }
   }
-  if (updates > 0) sheet.getRange(2, idxW + 1, nRows, 1).setValues(out.map(v => [v]));
+  
+  if (updates > 0) {
+    sheet.getRange(2, idxW + 1, nRows, 1).setValues(out.map(v => [v]));
+  }
   return updates;
 }
 
 function backfillTotalsForMissing_(limit) {
   const sheet = ensureSheet_('Órdenes');
   if (sheet.getLastRow() <= 1) return 0;
+
   const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
   const idxId   = headers.indexOf('id');
   const idxShip = headers.indexOf('total_shipping');
@@ -255,40 +312,51 @@ function backfillTotalsForMissing_(limit) {
   const ship = idxShip !== -1 ? sheet.getRange(2, idxShip+1, n, 1).getValues().flat() : null;
   const disc = idxDisc !== -1 ? sheet.getRange(2, idxDisc+1, n, 1).getValues().flat() : null;
 
+  // Selecciona hasta 'limit' ids con faltantes
+  const cap = Number(limit) > 0 ? Number(limit) : 0;
   const missingIds = [];
   for (let i=0; i<n; i++) {
     const needShip = ship && (ship[i] == null || ship[i] === '');
     const needDisc = disc && (disc[i] == null || disc[i] === '');
-    if ((needShip || needDisc) && ids[i]) missingIds.push(ids[i]);
-    if (limit && missingIds.length >= limit) break;
+    if ((needShip || needDisc) && ids[i]) {
+      missingIds.push(ids[i]);
+      if (cap && missingIds.length >= cap) break;
+    }
   }
   if (!missingIds.length) return 0;
 
   const fetched = fetchByIds_({
     recurso: 'orders',
-    fields: FIELDS.orders, // ya incluye total_shipping/total_discounts
+    fields: FIELDS.orders, // Ya incluye total_shipping/total_discounts
     ids: Array.from(new Set(missingIds)),
     claveLista: 'orders'
   });
+
   const map = {};
   fetched.forEach(o => { map[String(o.id)] = o; });
 
   let updates = 0;
+
   for (let i=0; i<n; i++) {
     const oid = ids[i];
     const o = map[oid];
     if (!o) continue;
+
     if (ship && (ship[i] == null || ship[i] === '') && o.total_shipping != null && o.total_shipping !== '') {
-      ship[i] = o.total_shipping; updates++;
+      const chosen = (typeof chooseNumeric_ === 'function') ? chooseNumeric_(ship[i], o.total_shipping) : o.total_shipping;
+      if (String(chosen) !== String(ship[i])) { ship[i] = chosen; updates++; }
     }
     if (disc && (disc[i] == null || disc[i] === '') && o.total_discounts != null && o.total_discounts !== '') {
-      disc[i] = o.total_discounts; updates++;
+      const chosen = (typeof chooseNumeric_ === 'function') ? chooseNumeric_(disc[i], o.total_discounts) : o.total_discounts;
+      if (String(chosen) !== String(disc[i])) { disc[i] = chosen; updates++; }
     }
   }
+
   if (updates) {
     if (ship) sheet.getRange(2, idxShip+1, n, 1).setValues(ship.map(v => [v]));
     if (disc) sheet.getRange(2, idxDisc+1, n, 1).setValues(disc.map(v => [v]));
   }
-  safeNotify_(`Backfill totals: ${updates} celdas actualizadas.`);
+
+  if (updates) safeNotify_(`Backfill totals: ${updates} celdas actualizadas.`);
   return updates;
 }

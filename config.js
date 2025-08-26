@@ -60,7 +60,7 @@ function fetchJson_(url) {
     }
     
     if (code >= 500) {
-      Utilities.sleep(800 * (i + 1));
+      Utilities.sleep(CONFIG.BASE_BACKOFF_MS * (i + 1));
       lastErr = `HTTP ${code}: ${body.slice(0,180)}`;
       continue;
     }
@@ -202,7 +202,7 @@ function buildWeightMapByOrderIds_(orderIds) {
       `&limit=0,${slice.length}` +
       `&output_format=JSON&io_format=JSON`;
 
-    // reintentos con backoff si el host limita (bandwidth / 429 / 5xx)
+    // Reintentos con backoff si el host limita (bandwidth / 429 / 5xx)
     let attempts = 0;
     while (true) {
       try {
