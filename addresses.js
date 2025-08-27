@@ -17,7 +17,7 @@ function traerDirecciones() {
   const lista = fetchByIds_({ recurso: 'addresses', fields: FIELDS.addresses, ids: idsUnicos, claveLista: 'addresses' });
 
   // 3) Esquema objetivo
-  const headers = ['id','id_customer','alias','address1','address2','direccion_completa','city','postcode','id_country','phone','phone_mobile','telefono_preferido'];
+  const headers = ['id','id_customer','alias','address1','address2','city','postcode','id_country','phone','phone_mobile'];
 
   // 4) Preparar hoja Direcciones y headers
   const shDir = ensureSheet_('Direcciones');
@@ -85,33 +85,10 @@ function traerDirecciones() {
     // Derivados
     const a1 = (a.address1 || '').trim();
     const a2 = (a.address2 || '').trim();
-    const dirCompleta = (a1 + (a2 ? (' ' + a2) : '')).trim();
-
     const phone  = (a.phone || '').toString().trim();
     const mobile = (a.phone_mobile || '').toString().trim();
-    const telPreferidoApi = mobile ? mobile : phone;
-
-    // índices de columnas (cálcularlos una vez, fuera del bucle si prefieres)
-    const idxFull = headersActuales.indexOf('direccion_completa');
-    const idxPref = headersActuales.indexOf('telefono_preferido');
 
     const existsRow = rowById.get(id) || 0; // 0 si no existe
-
-    // Fuerza escritura sólo si la celda actual está vacía y el nuevo valor existe
-    if (existsRow && idxFull !== -1) {
-      const cur = shDir.getRange(existsRow, idxFull + 1).getValue();
-      if (!cur && dirCompleta) {
-        shDir.getRange(existsRow, idxFull + 1).setValue(dirCompleta);
-        actualizadas++;
-      }
-    }
-    if (existsRow && idxPref !== -1) {
-      const cur = shDir.getRange(existsRow, idxPref + 1).getValue();
-      if (!cur && telPreferidoApi) {
-        shDir.getRange(existsRow, idxPref + 1).setValue(telPreferidoApi);
-        actualizadas++;
-      }
-    }
 
     if (!existsRow) {
       // 6.1) Nueva fila: construimos en el orden de 'headersActuales'
@@ -122,13 +99,11 @@ function traerDirecciones() {
           case 'alias':               return a.alias || '';
           case 'address1':            return a1;
           case 'address2':            return a2;
-          case 'direccion_completa':  return dirCompleta;
           case 'city':                return a.city || '';
           case 'postcode':            return a.postcode || '';
           case 'id_country':          return a.id_country || '';
           case 'phone':               return phone || '';
           case 'phone_mobile':        return mobile || '';
-          case 'telefono_preferido':  return telPreferidoApi || '';
           default:                    return '';
         }
       });
@@ -152,18 +127,11 @@ function traerDirecciones() {
           case 'alias':           incoming = a.alias || ''; break;
           case 'address1':        incoming = a1; break;
           case 'address2':        incoming = a2; break;
-          case 'direccion_completa':    incoming = dirCompleta; break;
           case 'city':            incoming = a.city || ''; break;
           case 'postcode':        incoming = a.postcode || ''; break;
           case 'id_country':      incoming = a.id_country || ''; break;
           case 'phone':           incoming = phone; break;
           case 'phone_mobile':    incoming = mobile; break;
-          case 'telefono_preferido':        {
-            const preferApi = telPreferidoApi || '';
-            // si ya hay preferido, solo mejora si el nuevo no está vacío y el actual está vacío
-            incoming = chooseValue_(current, preferApi);
-            break;
-          }
           default:
             incoming = current;
         }
@@ -194,16 +162,11 @@ function debugDireccionPorId_(addrId) {
   const sh = ensureSheet_('Direcciones');
   const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
   const idxId = headers.indexOf('id');
-  const idxFull = headers.indexOf('direccion_completa');
-  const idxPref = headers.indexOf('telefono_preferido');
   const n = sh.getLastRow() - 1;
   const ids = sh.getRange(2, idxId+1, n, 1).getValues().flat().map(String);
 
   const row = ids.indexOf(String(addrId));
   if (row === -1) return Logger.log('No está ese id en hoja');
-
-  const curFull = sh.getRange(2+row, idxFull+1).getValue();
-  const curPref = sh.getRange(2+row, idxPref+1).getValue();
 
   // Vuelve a pedir a la API sólo ese address
   const [a] = fetchByIds_({
